@@ -20,6 +20,9 @@
   (:import [java.util.concurrent Executors])
   (:import [backtype.storm.messaging TransportFactory])
   (:import [backtype.storm.messaging IContext IConnection])
+  (:import [backtype.storm.security.auth AuthUtils])
+  (:import [javax.security.auth Subject])
+  (:import [java.security PrivilegedExceptionAction])
   (:gen-class))
 
 (bootstrap)
@@ -164,21 +167,17 @@
                        (halt-process! 20 "Error when processing an event")
                        )))
 
-(defn worker-data [conf mq-context storm-id assignment-id port worker-id]
-  (let [cluster-state (cluster/mk-distributed-cluster-state conf)
-        storm-cluster-state (cluster/mk-storm-cluster-state cluster-state)
-        storm-conf (read-supervisor-storm-conf conf storm-id)
-        executors (set (read-worker-executors storm-conf storm-cluster-state storm-id assignment-id port))
-        transfer-queue (disruptor/disruptor-queue (storm-conf TOPOLOGY-TRANSFER-BUFFER-SIZE)
-                                                  :wait-strategy (storm-conf TOPOLOGY-DISRUPTOR-WAIT-STRATEGY))
-        executor-receive-queue-map (mk-receive-queue-map storm-conf executors)
-        
-        receive-queue-map (->> executor-receive-queue-map
-                               (mapcat (fn [[e queue]] (for [t (executor-id->tasks e)] [t queue])))
-                               (into {}))
-
-        topology (read-supervisor-topology conf storm-id)]
-    (recursive-map
+(defn recursive-map-worker-data [conf mq-context storm-id assignment-id port
+                                  storm-conf
+                                  worker-id 
+                                  cluster-state 
+                                  storm-cluster-state
+                                  executors 
+                                  transfer-queue
+                                  executor-receive-queue-map 
+                                  receive-queue-map
+                                  topology]
+  (recursive-map
       :conf conf
       :mq-context (if mq-context
                       mq-context
@@ -197,6 +196,7 @@
       :system-topology (system-topology! storm-conf topology)
       :heartbeat-timer (mk-halting-timer)
       :refresh-connections-timer (mk-halting-timer)
+      :refresh-credentials-timer (mk-halting-timer)
       :refresh-active-timer (mk-halting-timer)
       :executor-heartbeat-timer (mk-halting-timer)
       :user-timer (mk-halting-timer)
@@ -219,7 +219,31 @@
       :user-shared-resources (mk-user-resources <>)
       :transfer-local-fn (mk-transfer-local-fn <>)
       :transfer-fn (mk-transfer-fn <>)
-      )))
+      ))
+
+(defn worker-data [conf mq-context storm-id assignment-id port worker-id storm-conf cluster-state storm-cluster-state]
+  (let [executors (set (read-worker-executors storm-conf storm-cluster-state storm-id assignment-id port))
+        transfer-queue (disruptor/disruptor-queue (storm-conf TOPOLOGY-TRANSFER-BUFFER-SIZE)
+                                                  :wait-strategy (storm-conf TOPOLOGY-DISRUPTOR-WAIT-STRATEGY))
+        executor-receive-queue-map (mk-receive-queue-map storm-conf executors)
+        
+        receive-queue-map (->> executor-receive-queue-map
+                               (mapcat (fn [[e queue]] (for [t (executor-id->tasks e)] [t queue])))
+                               (into {}))
+
+        topology (read-supervisor-topology conf storm-id)]
+        (recursive-map-worker-data 
+          conf mq-context storm-id assignment-id port
+          storm-conf
+          worker-id 
+          cluster-state 
+          storm-cluster-state
+          executors 
+          transfer-queue
+          executor-receive-queue-map 
+          receive-queue-map
+          topology)
+  ))
 
 (defn- endpoint->string [[node port]]
   (str port "/" node))
@@ -350,14 +374,23 @@
   ;; process. supervisor will register it in this case
   (when (= :distributed (cluster-mode conf))
     (touch (worker-pid-path conf worker-id (process-pid))))
-  (let [worker (worker-data conf shared-mq-context storm-id assignment-id port worker-id)
+  (let [storm-conf (read-supervisor-storm-conf conf storm-id)
+        acls (Utils/getWorkerACL storm-conf)
+        cluster-state (cluster/mk-distributed-cluster-state conf :auth-conf storm-conf :acls acls)
+        storm-cluster-state (cluster/mk-storm-cluster-state cluster-state :acls acls)
+        initial-credentials (.credentials storm-cluster-state storm-id nil)
+        auto-creds (AuthUtils/GetAutoCredentials storm-conf)
+        subject (AuthUtils/populateSubject nil auto-creds initial-credentials)]
+      (Subject/doAs subject (reify PrivilegedExceptionAction 
+        (run [this]
+          (let [worker (worker-data conf shared-mq-context storm-id assignment-id port worker-id storm-conf cluster-state storm-cluster-state)
         heartbeat-fn #(do-heartbeat worker)
         ;; do this here so that the worker process dies if this fails
         ;; it's important that worker heartbeat to supervisor ASAP when launching so that the supervisor knows it's running (and can move on)
-        _ (heartbeat-fn)
+        ;;Commented out because overloaded ZK can slow down subsiquent calls, and zupervisor kills worker _ (heartbeat-fn)
         
         ;; heartbeat immediately to nimbus so that it knows that the worker has been started
-        _ (do-executor-heartbeats worker)
+        ;;Commented out to avoid issues when ZK is overloaded _ (do-executor-heartbeats worker)
         
         
         executors (atom nil)
@@ -366,13 +399,12 @@
         _ (schedule-recurring (:heartbeat-timer worker) 0 (conf WORKER-HEARTBEAT-FREQUENCY-SECS) heartbeat-fn)
         _ (schedule-recurring (:executor-heartbeat-timer worker) 0 (conf TASK-HEARTBEAT-FREQUENCY-SECS) #(do-executor-heartbeats worker :executors @executors))
 
-        
         refresh-connections (mk-refresh-connections worker)
 
         _ (refresh-connections nil)
         _ (refresh-storm-active worker nil)
  
-        _ (reset! executors (dofor [e (:executors worker)] (executor/mk-executor worker e)))
+        _ (reset! executors (dofor [e (:executors worker)] (executor/mk-executor worker e initial-credentials)))
         receive-thread-shutdown (launch-receive-thread worker)
         
         transfer-tuples (mk-transfer-tuples-handler worker)
@@ -403,6 +435,7 @@
                     (log-message "Shut down transfer thread")
                     (cancel-timer (:heartbeat-timer worker))
                     (cancel-timer (:refresh-connections-timer worker))
+                    (cancel-timer (:refresh-credentials-timer worker))
                     (cancel-timer (:refresh-active-timer worker))
                     (cancel-timer (:executor-heartbeat-timer worker))
                     (cancel-timer (:user-timer worker))
@@ -426,19 +459,29 @@
                (and
                  (timer-waiting? (:heartbeat-timer worker))
                  (timer-waiting? (:refresh-connections-timer worker))
+                 (timer-waiting? (:refresh-credentials-timer worker))
                  (timer-waiting? (:refresh-active-timer worker))
                  (timer-waiting? (:executor-heartbeat-timer worker))
                  (timer-waiting? (:user-timer worker))
                  ))
-             )]
-    
+             )
+        credentials (atom initial-credentials)
+        check-credentials-changed (fn []
+                                    (let [new-creds (.credentials (:storm-cluster-state worker) storm-id nil)]
+                                      (when-not (= new-creds @credentials) ;;This does not have to be atomic, worst case we update when one is not needed
+                                        (AuthUtils/updateSubject subject auto-creds new-creds)
+                                        (dofor [e @executors] (.credentials-changed e new-creds))
+                                        (reset! credentials new-creds))))
+      ]
+    (.credentials (:storm-cluster-state worker) storm-id (fn [args] (check-credentials-changed)))
+    (schedule-recurring (:refresh-credentials-timer worker) 0 (conf TASK-CREDENTIALS-POLL-SECS) check-credentials-changed)
     (schedule-recurring (:refresh-connections-timer worker) 0 (conf TASK-REFRESH-POLL-SECS) refresh-connections)
     (schedule-recurring (:refresh-active-timer worker) 0 (conf TASK-REFRESH-POLL-SECS) (partial refresh-storm-active worker))
 
     (log-message "Worker has topology config " (:storm-conf worker))
     (log-message "Worker " worker-id " for storm " storm-id " on " assignment-id ":" port " has finished loading")
     ret
-    ))
+    ))))))
 
 (defmethod mk-suicide-fn
   :local [conf]
@@ -449,6 +492,8 @@
   (fn [] (halt-process! 1 "Worker died")))
 
 (defn -main [storm-id assignment-id port-str worker-id]  
-  (let [conf (read-storm-config)]
+  (let [conf1 (read-storm-config)
+        login_conf_file (System/getProperty "java.security.auth.login.config")
+        conf (if login_conf_file (merge conf1 {"java.security.auth.login.config" login_conf_file}) conf1)]
     (validate-distributed-mode! conf)
     (mk-worker conf nil (java.net.URLDecoder/decode storm-id) assignment-id (Integer/parseInt port-str) worker-id)))

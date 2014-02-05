@@ -16,10 +16,12 @@
 (ns backtype.storm.ui.helpers
   (:use compojure.core)
   (:use [hiccup core page-helpers])
-  (:use [clojure [string :only [join]]])
+  (:use [clojure [string :only [blank? join]]])
+  (:use [backtype.storm config log])
   (:use [backtype.storm.util :only [uuid defnk]])
   (:use [clj-time coerce format])
   (:import [backtype.storm.generated ExecutorInfo ExecutorSummary])
+  (:require [ring.util servlet])
   (:require [compojure.route :as route]
             [compojure.handler :as handler]))
 
@@ -146,4 +148,21 @@ $(\"table#%s\").each(function(i) { $(this).tablesorter({ sortList: %s, headers: 
 
 (defn pretty-executor-info [^ExecutorInfo e]
   (str "[" (.get_task_start e) "-" (.get_task_end e) "]"))
+
+(defn unauthorized-user-html [user]
+  [[:h2 "User '" (escape-html user) "' is not authorized."]])
+
+(defn config-filter [server handler filter-class filter-params]
+  (if filter-class
+    (let [filter (doto (org.mortbay.jetty.servlet.FilterHolder.)
+                   (.setName "springSecurityFilterChain")
+                   (.setClassName filter-class)
+                   (.setInitParameters filter-params))
+          servlet (doto (org.mortbay.jetty.servlet.ServletHolder. (ring.util.servlet/servlet handler))
+                    (.setName "default"))
+          context (doto (org.mortbay.jetty.servlet.Context. server "/")
+                    (.addFilter filter "/*" 0)
+                    (.addServlet servlet "/"))]
+      (log-message "configuring filter " filter-class)
+      (.addHandler server context))))
 

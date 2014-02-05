@@ -24,12 +24,15 @@
   (:import [java.util.zip ZipFile])
   (:import [java.util.concurrent.locks ReentrantReadWriteLock])
   (:import [java.util.concurrent Semaphore])
-  (:import [java.io File FileOutputStream StringWriter PrintWriter IOException])
+  (:import [java.io File FileOutputStream RandomAccessFile StringWriter
+            PrintWriter BufferedReader InputStreamReader IOException])
   (:import [java.lang.management ManagementFactory])
   (:import [org.apache.commons.exec DefaultExecutor CommandLine])
   (:import [org.apache.commons.io FileUtils])
   (:import [org.apache.commons.exec ExecuteException])
   (:import [org.json.simple JSONValue])
+  (:import [org.yaml.snakeyaml Yaml]
+           [org.yaml.snakeyaml.constructor SafeConstructor])
   (:require [clojure [string :as str]])
   (:import [clojure.lang RT])
   (:require [clojure [set :as set]])
@@ -394,15 +397,16 @@
     (log-message "Error when trying to kill " pid ". Process is probably already dead."))
     ))
 
-(defnk launch-process [command :environment {}]
-  (let [command (->> (seq (.split command " "))
-                     (filter (complement empty?)))
-        builder (ProcessBuilder. command)
-        process-env (.environment builder)]
-    (doseq [[k v] environment]
-      (.put process-env k v))
-    (.start builder)
-    ))
+(defn read-and-log-stream [prefix stream]
+  (try
+    (let [reader (BufferedReader. (InputStreamReader. stream))]
+      (loop []
+        (if-let [line (.readLine reader)]
+                (do
+                  (log-warn (str prefix ":" line))
+                  (recur)))))
+    (catch IOException e
+      (log-warn "Error while trying to log stream" e))))
 
 (defn sleep-secs [secs]
   (when (pos? secs)
@@ -462,6 +466,36 @@
         ))
       ))
 
+(defnk write-script [dir command :environment {}]
+  (let [script-src (str "#!/bin/bash\n" (clojure.string/join "" (map (fn [[k v]] (str "export '" k "=" v "';\n")) environment)) "\nexec " command ";")
+        script-path (str dir "/storm-worker-script.sh")
+        - (spit script-path script-src)]
+    script-path
+  ))
+
+(defnk launch-process [command :environment {} :log-prefix nil :exit-code-callback nil]
+  (let [command (->> (seq (.split command " "))
+                     (filter (complement empty?)))
+        builder (ProcessBuilder. command)
+        process-env (.environment builder)]
+    (.redirectErrorStream builder true)
+    (doseq [[k v] environment]
+      (.put process-env k v))
+    (let [process (.start builder)]
+      (if (or log-prefix exit-code-callback)
+        (async-loop
+         (fn []
+           (if log-prefix
+             (read-and-log-stream log-prefix (.getInputStream process)))
+           (when exit-code-callback
+             (try
+               (.waitFor process)
+               (catch InterruptedException e
+                 (log-message log-prefix " interrupted.")))
+             (exit-code-callback (.exitValue process)))
+           nil)))                    
+      process)))
+          
 (defn exists-file? [path]
   (.exists (File. path)))
 
@@ -884,3 +918,32 @@
                 (meta form))
               (list form x)))
   ([x form & more] `(-<> (-<> ~x ~form) ~@more)))
+
+(def LOG-DIR
+  (.getCanonicalPath 
+                (clojure.java.io/file (System/getProperty "storm.home") "logs")))
+
+(defn- logs-rootname [storm-id port]
+  (str storm-id "-worker-" port))
+
+(defn logs-filename [storm-id port]
+  (str (logs-rootname storm-id port) ".log"))
+
+(defn logs-metadata-filename [storm-id port]
+  (str (logs-rootname storm-id port) ".yaml"))
+
+(def worker-log-filename-pattern #"((.*-\d+-\d+)-worker-(\d+)).log")
+
+(defn get-log-metadata-file
+  ([fname]
+    (if-let [[_ _ id port] (re-matches worker-log-filename-pattern fname)]
+      (get-log-metadata-file id port)))
+  ([id port]
+    (clojure.java.io/file LOG-DIR "metadata" (logs-metadata-filename id port))))
+
+(defn clojure-from-yaml-file [yamlFile]
+  (try
+    (let [obj (.load (Yaml. (SafeConstructor.)) (java.io.FileReader. yamlFile))]
+      (clojurify-structure obj))
+    (catch Exception ex
+      (log-error ex))))

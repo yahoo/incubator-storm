@@ -17,36 +17,27 @@
  */
 package backtype.storm.drpc;
 
+import java.util.Map;
+
 import backtype.storm.generated.DRPCRequest;
 import backtype.storm.generated.DistributedRPCInvocations;
+import backtype.storm.generated.AuthorizationException;
+import backtype.storm.security.auth.ThriftClient;
+import org.apache.thrift.transport.TTransportException;
 import org.apache.thrift.TException;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TFramedTransport;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransport;
 
-public class DRPCInvocationsClient implements DistributedRPCInvocations.Iface {
-    private TTransport conn;
+public class DRPCInvocationsClient extends ThriftClient implements DistributedRPCInvocations.Iface {
     private DistributedRPCInvocations.Client client;
     private String host;
     private int port;    
 
-    public DRPCInvocationsClient(String host, int port) {
-        try {
-            this.host = host;
-            this.port = port;
-            connect();
-        } catch(TException e) {
-            throw new RuntimeException(e);
-        }
+    public DRPCInvocationsClient(Map conf, String host, int port) throws TTransportException {
+        super(conf, host, port, null);
+        this.host = host;
+        this.port = port;
+        client = new DistributedRPCInvocations.Client(_protocol);
     }
-    
-    private void connect() throws TException {
-        conn = new TFramedTransport(new TSocket(host, port));
-        client = new DistributedRPCInvocations.Client(new TBinaryProtocol(conn));
-        conn.open();
-    }
-    
+        
     public String getHost() {
         return host;
     }
@@ -55,9 +46,8 @@ public class DRPCInvocationsClient implements DistributedRPCInvocations.Iface {
         return port;
     }       
 
-    public void result(String id, String result) throws TException {
+    public void result(String id, String result) throws TException, AuthorizationException {
         try {
-            if(client==null) connect();
             client.result(id, result);
         } catch(TException e) {
             client = null;
@@ -65,9 +55,8 @@ public class DRPCInvocationsClient implements DistributedRPCInvocations.Iface {
         }
     }
 
-    public DRPCRequest fetchRequest(String func) throws TException {
+    public DRPCRequest fetchRequest(String func) throws TException, AuthorizationException {
         try {
-            if(client==null) connect();
             return client.fetchRequest(func);
         } catch(TException e) {
             client = null;
@@ -75,9 +64,8 @@ public class DRPCInvocationsClient implements DistributedRPCInvocations.Iface {
         }
     }    
 
-    public void failRequest(String id) throws TException {
+    public void failRequest(String id) throws TException, AuthorizationException {
         try {
-            if(client==null) connect();
             client.failRequest(id);
         } catch(TException e) {
             client = null;
@@ -85,7 +73,7 @@ public class DRPCInvocationsClient implements DistributedRPCInvocations.Iface {
         }
     }
 
-    public void close() {
-        conn.close();
+    public DistributedRPCInvocations.Client getClient() {
+        return client;
     }
 }

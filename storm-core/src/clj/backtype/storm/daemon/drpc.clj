@@ -14,17 +14,22 @@
 ;; See the License for the specific language governing permissions and
 ;; limitations under the License.
 (ns backtype.storm.daemon.drpc
-  (:import [org.apache.thrift.server THsHaServer THsHaServer$Args])
-  (:import [org.apache.thrift.protocol TBinaryProtocol TBinaryProtocol$Factory])
-  (:import [org.apache.thrift.exception])
-  (:import [org.apache.thrift.transport TNonblockingServerTransport TNonblockingServerSocket])
+  (:import [backtype.storm.security.auth AuthUtils])
+  (:import [org.apache.thrift TException])
   (:import [backtype.storm.generated DistributedRPC DistributedRPC$Iface DistributedRPC$Processor
             DRPCRequest DRPCExecutionException DistributedRPCInvocations DistributedRPCInvocations$Iface
             DistributedRPCInvocations$Processor])
   (:import [java.util.concurrent Semaphore ConcurrentLinkedQueue ThreadPoolExecutor ArrayBlockingQueue TimeUnit])
   (:import [backtype.storm.daemon Shutdownable])
   (:import [java.net InetAddress])
+  (:import [backtype.storm.generated AuthorizationException])
   (:use [backtype.storm bootstrap config log])
+  (:use [backtype.storm.daemon common])
+  (:use [backtype.storm.ui helpers])
+  (:use compojure.core)
+  (:use ring.middleware.reload)
+  (:use [ring.adapter.jetty :only [run-jetty]])
+  (:require [compojure.handler :as handler])
   (:gen-class))
 
 (bootstrap)
@@ -40,9 +45,17 @@
         ))
   (@queues-atom function))
 
+(defn check-authorization! [aclHandler storm-conf operation]
+  (log-debug "DRPC check-authorization with handler: " aclHandler)
+  (if aclHandler
+    (if-not (.permit aclHandler (ReqContext/context) operation storm-conf)
+          (throw (AuthorizationException. (str "DRPC request " operation " is not authorized")))
+          )))
+
 ;; TODO: change this to use TimeCacheMap
-(defn service-handler []
-  (let [conf (read-storm-config)
+(defn service-handler [conf]
+  (let [drpc-acl-handler (mk-authorization-handler (conf DRPC-AUTHORIZER) conf)
+        invocations-acl-handler (mk-authorization-handler (conf DRPC-INVOCATIONS-AUTHORIZER) conf)
         ctr (atom 0)
         id->sem (atom {})
         id->result (atom {})
@@ -67,6 +80,7 @@
     (reify DistributedRPC$Iface
       (^String execute [this ^String function ^String args]
         (log-debug "Received DRPC request for " function " " args " at " (System/currentTimeMillis))
+        (check-authorization! drpc-acl-handler conf "execute")
         (let [id (str (swap! ctr (fn [v] (mod (inc v) 1000000000))))
               ^Semaphore sem (Semaphore. 0)
               req (DRPCRequest. args id)
@@ -87,6 +101,7 @@
               ))))
       DistributedRPCInvocations$Iface
       (^void result [this ^String id ^String result]
+        (check-authorization! invocations-acl-handler conf "result")
         (let [^Semaphore sem (@id->sem id)]
           (log-debug "Received result " result " for " id " at " (System/currentTimeMillis))
           (when sem
@@ -94,12 +109,14 @@
             (.release sem)
             )))
       (^void failRequest [this ^String id]
+        (check-authorization! invocations-acl-handler conf "failRequest")
         (let [^Semaphore sem (@id->sem id)]
           (when sem
             (swap! id->result assoc id (DRPCExecutionException. "Request failed"))
             (.release sem)
             )))
       (^DRPCRequest fetchRequest [this ^String func]
+        (check-authorization! invocations-acl-handler conf "fetchRequest")
         (let [^ConcurrentLinkedQueue queue (acquire-queue request-queues func)
               ret (.poll queue)]
           (if ret
@@ -112,35 +129,69 @@
         (.interrupt clear-thread))
       )))
 
+(defn handle-request [handler]
+  (fn [request]
+    (handler request)))
+
+(defn webapp [handler http-creds-handler]
+  (handler/site (->
+    (defroutes http-routes
+      (GET "/drpc/:func/:args" [:as {:keys [servlet-request]} func args & m]
+        (let [user (.getUserName http-creds-handler servlet-request)]
+          (log-debug "Servlet user was: " user)
+          (.execute handler func args)))
+      (GET "/drpc/:func/" [:as {:keys [servlet-request]} func & m]
+        (let [user (.getUserName http-creds-handler servlet-request)]
+          (log-debug "Servlet user was: " user)
+          (.execute handler func "")))
+      (GET "/drpc/:func" [:as {:keys [servlet-request]} func & m]
+        (let [user (.getUserName http-creds-handler servlet-request)]
+          (log-debug "Servlet user was: " user)
+          (.execute handler func ""))))
+    (wrap-reload '[backtype.storm.daemon.drpc])
+    handle-request)))
+
 (defn launch-server!
   ([]
     (let [conf (read-storm-config)
           worker-threads (int (conf DRPC-WORKER-THREADS))
           queue-size (int (conf DRPC-QUEUE-SIZE))
-          service-handler (service-handler)
+          drpc-http-port (int (conf DRPC-HTTP-PORT))
+          drpc-port (int (conf DRPC-PORT))
+          drpc-service-handler (service-handler conf)
           ;; requests and returns need to be on separate thread pools, since calls to
           ;; "execute" don't unblock until other thrift methods are called. So if 
           ;; 64 threads are calling execute, the server won't accept the result
           ;; invocations that will unblock those threads
-          handler-server (THsHaServer. (-> (TNonblockingServerSocket. (int (conf DRPC-PORT)))
-                                             (THsHaServer$Args.)
-                                             (.workerThreads 64)
-                                             (.executorService (ThreadPoolExecutor. worker-threads worker-threads 
-                                                                 60 TimeUnit/SECONDS (ArrayBlockingQueue. queue-size)))
-                                             (.protocolFactory (TBinaryProtocol$Factory.))
-                                             (.processor (DistributedRPC$Processor. service-handler))
-                                             ))
-          invoke-server (THsHaServer. (-> (TNonblockingServerSocket. (int (conf DRPC-INVOCATIONS-PORT)))
-                                             (THsHaServer$Args.)
-                                             (.workerThreads 64)
-                                             (.protocolFactory (TBinaryProtocol$Factory.))
-                                             (.processor (DistributedRPCInvocations$Processor. service-handler))
-                                             ))]
-      
-      (.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (.stop handler-server) (.stop invoke-server))))
+          handler-server (when (> drpc-port 0)
+                           (ThriftServer. conf
+                             (DistributedRPC$Processor. drpc-service-handler)
+                             drpc-port
+                             backtype.storm.Config$ThriftServerPurpose/DRPC
+                             (ThreadPoolExecutor. worker-threads worker-threads
+                               60 TimeUnit/SECONDS (ArrayBlockingQueue. queue-size))))
+          invoke-server (ThriftServer. conf
+                          (DistributedRPCInvocations$Processor. drpc-service-handler)
+                          (int (conf DRPC-INVOCATIONS-PORT))
+                          backtype.storm.Config$ThriftServerPurpose/DRPC)
+          http-creds-handler (AuthUtils/GetDrpcHttpCredentialsPlugin conf)]
+      (.addShutdownHook (Runtime/getRuntime) (Thread. (fn []
+                                                        (if handler-server (.stop handler-server))
+                                                        (.stop invoke-server))))
       (log-message "Starting Distributed RPC servers...")
       (future (.serve invoke-server))
-      (.serve handler-server))))
+      (when (> drpc-http-port 0)
+        (let [app (webapp drpc-service-handler http-creds-handler)
+              filter-class (conf DRPC-HTTP-FILTER)
+              filter-params (conf DRPC-HTTP-FILTER-PARAMS)]
+          (run-jetty app
+            {:port drpc-http-port :join? false
+             :configurator (fn [server]
+                             (config-filter server app
+                                            filter-class
+                                            filter-params))})))
+      (when handler-server
+        (.serve handler-server)))))
 
 (defn -main []
   (launch-server!))

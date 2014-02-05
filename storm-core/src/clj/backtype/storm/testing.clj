@@ -201,8 +201,8 @@
                   supervisors
                   workers) ; because a worker may already be dead
         ]
-    (while-timeout TEST-TIMEOUT-MS (not (every? (memfn waiting?) daemons))
-      (Thread/sleep 10)
+    (while-timeout TEST-TIMEOUT-MS (not (every? (memfn waiting?) daemons))      
+      (Thread/sleep (rand-int 20))
 ;;      (doseq [d daemons]
 ;;        (if-not ((memfn waiting?) d)
 ;;          (println d)))
@@ -277,7 +277,9 @@
 (defn mk-capture-launch-fn [capture-atom]
   (fn [supervisor storm-id port worker-id]
     (let [supervisor-id (:supervisor-id supervisor)
+          conf (:conf supervisor)
           existing (get @capture-atom [supervisor-id port] [])]
+      (set-worker-user! conf worker-id "")
       (swap! capture-atom assoc [supervisor-id port] (conj existing storm-id))
       )))
 

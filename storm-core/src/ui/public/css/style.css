@@ -19,6 +19,11 @@
     display: none;
 }
 
+.ui-user {
+    float: right;
+    padding: 0.5em;
+}
+
 body {
   color: #808080;
 }
