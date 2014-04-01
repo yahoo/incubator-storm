@@ -21,6 +21,7 @@ import backtype.storm.Config;
 import backtype.storm.messaging.IConnection;
 import backtype.storm.messaging.TaskMessage;
 import backtype.storm.utils.Utils;
+
 import org.jboss.netty.bootstrap.ClientBootstrap;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFactory;
@@ -32,6 +33,8 @@ import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
 import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.Random;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,13 +43,15 @@ import java.util.concurrent.atomic.AtomicReference;
 
 class Client implements IConnection {
     private static final Logger LOG = LoggerFactory.getLogger(Client.class);
+    private static final Timer TIMER = new Timer("netty-client-timer", true);
+
     private final int max_retries;
-    private final int base_sleep_ms;
-    private final int max_sleep_ms;
+    private final long base_sleep_ms;
+    private final long max_sleep_ms;
     private LinkedBlockingQueue<Object> message_queue; //entry should either be TaskMessage or ControlMessage
     private AtomicReference<Channel> channelRef;
     private final ClientBootstrap bootstrap;
-    private InetSocketAddress remote_addr;
+    InetSocketAddress remote_addr;
     private AtomicInteger retries;
     private final Random random = new Random();
     private final ChannelFactory factory;
@@ -91,29 +96,32 @@ class Client implements IConnection {
         //reconnect only if it's not being closed
         if (being_closed.get()) return;
 
-        try {
-            int tried_count = retries.incrementAndGet();
-            if (tried_count <= max_retries) {
-                Thread.sleep(getSleepTimeMs());
-                LOG.info("Reconnect ... [{}]", tried_count);
-                bootstrap.connect(remote_addr);
-                LOG.debug("connection started...");
-            } else {
-                LOG.warn("Remote address is not reachable. We will close this client.");
-                close();
-            }
-        } catch (InterruptedException e) {
-            LOG.warn("connection failed", e);
+        final int tried_count = retries.incrementAndGet();
+        if (tried_count <= max_retries) {
+            long sleep = getSleepTimeMs();
+            LOG.info("Waiting {} ms before trying connection to {}", sleep, remote_addr);
+            TIMER.schedule(new TimerTask() {
+                @Override
+                public void run() { 
+                    LOG.info("Reconnect ... [{}] to {}", tried_count, remote_addr);
+                    bootstrap.connect(remote_addr);
+                }}, sleep);
+        } else {
+            LOG.warn(remote_addr+" is not reachable. We will close this client.");
+            close();
         }
     }
 
     /**
      * # of milliseconds to wait per exponential back-off policy
      */
-    private int getSleepTimeMs()
+    private long getSleepTimeMs()
     {
+        if (retries.get() > 30) {
+           return max_sleep_ms;
+        }
         int backoff = 1 << retries.get();
-        int sleepMs = base_sleep_ms * Math.max(1, random.nextInt(backoff));
+        long sleepMs = base_sleep_ms * Math.max(1, random.nextInt(backoff));
         if ( sleepMs > max_sleep_ms )
             sleepMs = max_sleep_ms;
         return sleepMs;
@@ -148,6 +156,12 @@ class Client implements IConnection {
         //make sure that channel was not closed
         Channel channel = channelRef.get();
         if (channel == null)  return;
+        if (!channel.isOpen()) {
+            LOG.info("Channel to {} is no longer open.",remote_addr);
+            //The channel is not open yet. Reconnect?
+            reconnect();
+            return;
+        }
 
         final MessageBatch requests = tryTakeMessages();
         if (requests==null) {
@@ -171,8 +185,8 @@ class Client implements IConnection {
             public void operationComplete(ChannelFuture future)
                     throws Exception {
                 if (!future.isSuccess()) {
-                    LOG.info("failed to send requests:", future.getCause());
-                    close_n_release();
+                    LOG.info("failed to send "+requests.size()+" requests to "+remote_addr, future.getCause());
+                    reconnect();
                 } else {
                     LOG.debug("{} request(s) sent", requests.size());
 
@@ -200,6 +214,7 @@ class Client implements IConnection {
         MessageBatch batch = new MessageBatch(buffer_size);
         //we will discard any message after CLOSE
         if (msg == ControlMessage.CLOSE_MESSAGE) {
+            LOG.info("Connection to {} is being closed", remote_addr);
             being_closed.set(true);
             return batch;
         }
@@ -209,6 +224,7 @@ class Client implements IConnection {
             //Is it a CLOSE message?
             if (msg == ControlMessage.CLOSE_MESSAGE) {
                 message_queue.take();
+                LOG.info("Connection to {} is being closed", remote_addr);
                 being_closed.set(true);
                 break;
             }
@@ -237,6 +253,8 @@ class Client implements IConnection {
             //resume delivery if it is waiting for requests
             tryDeliverMessages(true);
         } catch (InterruptedException e) {
+            LOG.info("Interrupted Connection to {} is being closed", remote_addr);
+            being_closed.set(true);
             close_n_release();
         }
     }
@@ -247,7 +265,7 @@ class Client implements IConnection {
     synchronized void close_n_release() {
         if (channelRef.get() != null) {
             channelRef.get().close();
-            LOG.debug("channel closed");
+            LOG.debug("channel {} closed",remote_addr);
             setChannel(null);
         }
     }
@@ -257,6 +275,10 @@ class Client implements IConnection {
     }
 
     void setChannel(Channel channel) {
+        if (channel != null && channel.isOpen()) {
+            //Assume the most recent connection attempt was successful.
+            retries.set(0);
+        }
         channelRef.set(channel);
         //reset retries
         if (channel != null)
@@ -264,7 +286,3 @@ class Client implements IConnection {
     }
 
 }
-
-
-
-

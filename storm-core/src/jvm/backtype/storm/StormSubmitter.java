@@ -41,6 +41,8 @@ import org.json.simple.JSONValue;
 public class StormSubmitter {
     public static Logger LOG = LoggerFactory.getLogger(StormSubmitter.class);    
 
+    private static final int THRIFT_CHUNK_SIZE_BYTES = 307200;
+    
     private static ILocalCluster localNimbus = null;
 
     public static void setLocalNimbus(ILocalCluster localNimbusHandler) {
@@ -205,14 +207,14 @@ public class StormSubmitter {
                 if(topologyNameExists(conf, name)) {
                     throw new RuntimeException("Topology with name `" + name + "` already exists on cluster");
                 }
-                submitJar(conf);
+                String jar = submitJar(conf);
                 try {
                     LOG.info("Submitting topology " +  name + " in distributed mode with conf " + serConf);
                     if(opts!=null) {
-                        client.getClient().submitTopologyWithOpts(name, submittedJar, serConf, topology, opts);                    
+                        client.getClient().submitTopologyWithOpts(name, jar, serConf, topology, opts);                    
                     } else {
                         // this is for backwards compatibility
-                        client.getClient().submitTopology(name, submittedJar, serConf, topology);                                            
+                        client.getClient().submitTopology(name, jar, serConf, topology);                                            
                     }
                 } catch(InvalidTopologyException e) {
                     LOG.warn("Topology submission exception: "+e.get_msg());
@@ -248,16 +250,8 @@ public class StormSubmitter {
         }
     }
 
-    private static String submittedJar = null;
-    
-    private static void submitJar(Map conf) {
-        if(submittedJar==null) {
-            LOG.info("Jar not uploaded to master yet. Submitting jar...");
-            String localJar = System.getProperty("storm.jar");
-            submittedJar = submitJar(conf, localJar);
-        } else {
-            LOG.info("Jar already uploaded to master. Not submitting jar.");
-        }
+    private static String submitJar(Map conf) {
+        return  submitJar(conf, System.getProperty("storm.jar"));
     }
     
     public static String submitJar(Map conf, String localJar) {
@@ -268,7 +262,7 @@ public class StormSubmitter {
         try {
             String uploadLocation = client.getClient().beginFileUpload();
             LOG.info("Uploading topology jar " + localJar + " to assigned location: " + uploadLocation);
-            BufferFileInputStream is = new BufferFileInputStream(localJar);
+            BufferFileInputStream is = new BufferFileInputStream(localJar, THRIFT_CHUNK_SIZE_BYTES);
             while(true) {
                 byte[] toSubmit = is.read();
                 if(toSubmit.length==0) break;

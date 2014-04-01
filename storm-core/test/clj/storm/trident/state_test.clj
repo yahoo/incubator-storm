@@ -21,7 +21,7 @@
   (:import [storm.trident.state CombinerValueUpdater])
   (:import [storm.trident.topology.state TransactionalState TestTransactionalState])
   (:import [storm.trident.state.map TransactionalMap OpaqueMap])
-  (:import [storm.trident.testing MemoryBackingMap])
+  (:import [storm.trident.testing MemoryBackingMap MemoryMapState])
   (:import [backtype.storm.utils ZookeeperAuthInfo])
   (:import [com.netflix.curator.framework CuratorFramework])
   (:import [com.netflix.curator.framework.api CreateBuilder ProtectACLCreateModePathAndBytesable])
@@ -30,6 +30,12 @@
   (:import [org.mockito.exceptions.base MockitoAssertionError])
   (:use [storm.trident testing])
   (:use [backtype.storm config util]))
+
+(defn single-remove [map key]
+  (-> map (.multiRemove [[key]])))
+
+(defn single-put [map key val]
+  (-> map (.multiPut [[key]] [val])))
 
 (defn single-get [map key]
   (-> map (.multiGet [[key]]) first))
@@ -68,7 +74,9 @@
     (is (= nil (single-get map "a")))
     ;; tests that intra-batch caching works
     (is (= 1 (single-update map "a" 1)))
+    (is (= 1 (single-get map "a")))
     (is (= 3 (single-update map "a" 2)))
+    (is (= 3 (single-get map "a")))
     (.commit map 1)
     (.beginCommit map 1)
     (is (= nil (single-get map "a")))
@@ -118,3 +126,25 @@
           (. (Mockito/verify builder1) (withACL expectedAcls))
         (catch MockitoAssertionError e
           e)))))))
+
+(deftest test-memory-map-state-remove
+  (let [map (MemoryMapState. (uuid))]
+    (.beginCommit map 1)
+    (single-put map "a" 1)
+    (single-put map "b" 2)
+    (.commit map 1)
+    (.beginCommit map 2)
+    (single-remove map "a")
+    (is (nil? (single-get map "a")))
+    (is (= 2 (single-get map "b")))
+    (.commit map 2)
+    (.beginCommit map 2)
+    (is (= 1 (single-get map "a")))
+    (is (= 2 (single-get map "b")))
+    (single-remove map "a")
+    (.commit map 2)
+    (.beginCommit map 3)
+    (is (nil? (single-get map "a")))
+    (is (= 2 (single-get map "b")))    
+    (.commit map 3)
+    ))

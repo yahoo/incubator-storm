@@ -39,6 +39,9 @@ import org.json.simple.JSONValue;
 
 
 public class ReturnResults extends BaseRichBolt {
+    //ANY CHANGE TO THIS CODE MUST BE SERIALIZABLE COMPATIBLE OR THERE WILL BE PROBLEMS
+    static final long serialVersionUID = -774882142710631591L;
+
     public static final Logger LOG = LoggerFactory.getLogger(ReturnResults.class);
     OutputCollector _collector;
     boolean local;
@@ -79,16 +82,32 @@ public class ReturnResults extends BaseRichBolt {
                 }
                 client = _clients.get(server);
             }
-                
+ 
             try {
                 client.result(id, result);
                 _collector.ack(input);
             } catch(TException e) {
                 LOG.error("Failed to return results to DRPC server", e);
                 _collector.fail(input);
+                if (client instanceof DRPCInvocationsClient) {
+                    try {
+                        LOG.info("reconnecting... ");
+                        ((DRPCInvocationsClient)client).reconnectClient(); //Blocking call
+                    } catch (TException e2) {
+                        throw new RuntimeException(e2);
+                    }
+                }
             } catch (AuthorizationException aze) {
                 LOG.error("Not authorized to return results to DRPC server", aze);
                 _collector.fail(input);
+                if (client instanceof DRPCInvocationsClient) {
+                    try {
+                        LOG.info("reconnecting... ");
+                        ((DRPCInvocationsClient)client).reconnectClient(); //Blocking call
+                    } catch (TException e2) {
+                        throw new RuntimeException(e2);
+                    }
+                }
             }
         }
     }    

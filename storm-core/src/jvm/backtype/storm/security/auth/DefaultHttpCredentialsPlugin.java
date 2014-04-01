@@ -18,15 +18,22 @@
 
 package backtype.storm.security.auth;
 
+import java.security.Principal;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import javax.security.auth.Subject;
 import javax.servlet.http.HttpServletRequest;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import backtype.storm.security.auth.ReqContext;
 
 public class DefaultHttpCredentialsPlugin implements IHttpCredentialsPlugin {
+    private static final Logger LOG =
+            LoggerFactory.getLogger(DefaultHttpCredentialsPlugin.class);
+
     /**
      * No-op
      * @param storm_conf Storm configuration
@@ -43,8 +50,13 @@ public class DefaultHttpCredentialsPlugin implements IHttpCredentialsPlugin {
      */
     @Override
     public String getUserName(HttpServletRequest req) {
-        if (req != null) {
-            return req.getUserPrincipal().getName();
+        Principal princ = null;
+        if (req != null && (princ = req.getUserPrincipal()) != null) {
+            String userName = princ.getName();
+            if (userName != null && !userName.isEmpty()) {
+                LOG.debug("HTTP request had user ("+userName+")");
+                return userName;
+            }
         }
         return null;
     }
@@ -59,10 +71,13 @@ public class DefaultHttpCredentialsPlugin implements IHttpCredentialsPlugin {
     @Override
     public ReqContext populateContext(ReqContext context,
             HttpServletRequest req) {
-        Set<SingleUserPrincipal> principals = new HashSet<SingleUserPrincipal>(1);
-        principals.add(new SingleUserPrincipal(getUserName(req)));
-        Subject s = new Subject(true, principals, new HashSet(), new HashSet());
-        context.setSubject(s);
+        String userName = getUserName(req);
+        if (userName != null) {
+            Set<SingleUserPrincipal> principals = new HashSet<SingleUserPrincipal>(1);
+            principals.add(new SingleUserPrincipal(userName));
+            Subject s = new Subject(true, principals, new HashSet(), new HashSet());
+            context.setSubject(s);
+        }
         return context;
     }
 }

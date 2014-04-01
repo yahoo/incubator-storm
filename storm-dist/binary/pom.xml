@@ -21,7 +21,7 @@
     <parent>
         <artifactId>storm</artifactId>
         <groupId>org.apache.storm</groupId>
-        <version>0.9.1-incubating-SNAPSHOT</version>
+        <version>0.9.2-incubating-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <groupId>org.apache.storm</groupId>
@@ -54,6 +54,7 @@
             </executions>
             <configuration>
                 <attach>true</attach>
+                <runOnlyAtExecutionRoot>true</runOnlyAtExecutionRoot>
                 <descriptors>
                     <descriptor>${project.basedir}/src/main/assembly/binary.xml</descriptor>
                 </descriptors>
@@ -65,24 +66,10 @@
                 <artifactId>maven-gpg-plugin</artifactId>
                 <executions>
                     <execution>
-                        <phase>deploy</phase>
+                        <phase>package</phase>
                         <goals>
                             <goal>sign</goal>
                         </goals>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-install-plugin</artifactId>
-                <!--
-                    we don't need to install to the local repo
-                    so unbind from the install phase
-                -->
-                <executions>
-                    <execution>
-                        <id>default-install</id>
-                        <phase>none</phase>
                     </execution>
                 </executions>
             </plugin>

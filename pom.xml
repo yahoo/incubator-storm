@@ -27,7 +27,7 @@
 
     <groupId>org.apache.storm</groupId>
     <artifactId>storm</artifactId>
-    <version>0.9.1-incubating-SNAPSHOT</version>
+    <version>0.9.2-incubating-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>Storm</name>
     <description>Distributed and fault-tolerant realtime computation</description>
@@ -130,6 +130,7 @@
     <modules>
         <module>storm-buildtools/maven-shade-clojure-transformer</module>
         <module>storm-core</module>
+        <module>examples/storm-starter</module>
     </modules>
 
     <scm>
@@ -146,6 +147,7 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <test.extra.args>-Djava.net.preferIPv4Stack=true</test.extra.args>
 
         <!-- dependency versions -->
         <clojure.version>1.4.0</clojure.version>
@@ -318,7 +320,6 @@
                     </exclusion>
                 </exclusions>
             </dependency>
- 
             <dependency>
                 <groupId>com.netflix.curator</groupId>
                 <artifactId>curator-framework</artifactId>
@@ -468,7 +469,13 @@
                 <version>0.7.0</version>
                 <scope>compile</scope>
             </dependency>
-
+			<!-- used by examples/storm-starter -->
+		    <dependency>
+		      <groupId>junit</groupId>
+		      <artifactId>junit</artifactId>
+		      <version>3.8.1</version>
+		      <scope>test</scope>
+		    </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -595,9 +602,7 @@
                 <artifactId>maven-release-plugin</artifactId>
                 <configuration>
                     <autoVersionSubmodules>true</autoVersionSubmodules>
-                    <goals>deploy assembly:assembly</goals>
                     <tagNameFormat>v@{project.version}</tagNameFormat>
-                    <preparationGoals>clean verify</preparationGoals>
                 </configuration>
             </plugin>
             <plugin>
